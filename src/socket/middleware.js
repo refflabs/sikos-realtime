@@ -9,8 +9,8 @@ export function authMiddleware(socket, next) {
 
   console.log(`[realtime] Handshake auth attempt. Token present: ${Boolean(token)}`)
 
-  if (!token) {
-    console.log('[realtime] No token provided in handshake. Connecting as guest.')
+  if (!token || token === 'null' || token === 'undefined' || token === '') {
+    console.log('[realtime] No valid token provided in handshake. Connecting as guest.')
     socket.data.user = null
     return next()
   }

@@ -8,14 +8,8 @@ const CACHE_TTL = 60 * 1000 // 1 minute
  * @returns {Promise<{ id: number, role: string, email: string, name: string } | null>}
  */
 export async function verifyToken(token) {
-  if (!token || typeof token !== 'string') {
+  if (!token || typeof token !== 'string' || token === 'null' || token === 'undefined' || token === '') {
     return null
-  }
-
-  // Check cache
-  const cached = tokenCache.get(token)
-  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
-    return cached.user
   }
 
   const controller = new AbortController()
@@ -45,12 +39,6 @@ export async function verifyToken(token) {
       email: user.email,
       name: user.name,
     }
-
-    // Save to cache
-    tokenCache.set(token, {
-      user: userData,
-      timestamp: Date.now(),
-    })
 
     return userData
   } catch (err) {

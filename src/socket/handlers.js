@@ -1,9 +1,9 @@
 import { Channels, Events } from '../events.js'
-import { getChatHistory, addMessage, getChatThreads } from './chatStore.js'
+import { getChatHistory, addMessage, getChatThreads, deleteChatSession, deleteAllChats } from './chatStore.js'
 
 const ALLOWED_CHANNELS = new Set([Channels.PUBLIC, Channels.ADMIN])
 
-/* ── Presence store: userId → { name, role, socketId, since } ── */
+/* ── Presence store: userId → { name, role, socketIds: Set, since } ── */
 const onlineUsers = new Map()
 
 function broadcastPresence(io, userId, online) {
@@ -19,13 +19,53 @@ function broadcastPresence(io, userId, online) {
   io.to(Channels.ADMIN).emit(online ? Events.USER_ONLINE : Events.USER_OFFLINE, payload)
 }
 
+function handleUserOnline(io, socket, user) {
+  if (!user?.id) return
+
+  if (!onlineUsers.has(user.id)) {
+    onlineUsers.set(user.id, {
+      name: user.name,
+      role: user.role,
+      socketIds: new Set([socket.id]),
+      since: new Date().toISOString(),
+    })
+    broadcastPresence(io, user.id, true)
+
+    // Jika admin online → broadcast ke semua user
+    if (user.role === 'admin') {
+      socket.broadcast.emit(Events.USER_ONLINE, { userId: user.id, role: 'admin', online: true })
+    }
+  } else {
+    onlineUsers.get(user.id).socketIds.add(socket.id)
+  }
+}
+
+function handleUserOffline(io, socket, user) {
+  if (!user?.id) return
+
+  const info = onlineUsers.get(user.id)
+  if (info) {
+    info.socketIds.delete(socket.id)
+    if (info.socketIds.size === 0) {
+      onlineUsers.delete(user.id)
+      broadcastPresence(io, user.id, false)
+
+      if (user.role === 'admin') {
+        socket.broadcast.emit(Events.USER_OFFLINE, { userId: user.id, role: 'admin', online: false })
+      }
+    }
+  }
+}
+
 export function registerSocketHandlers(io, socket) {
   // Every client receives public room availability updates
   socket.join(Channels.PUBLIC)
 
-  // If user is logged in, join their user-specific room
+  // If user is logged in, join their user-specific room and automatically mark online
   if (socket.data.user?.id) {
-    socket.join(`user:${socket.data.user.id}`)
+    const user = socket.data.user
+    socket.join(`user:${user.id}`)
+    handleUserOnline(io, socket, user)
   }
 
   socket.on(Events.CLIENT_SUBSCRIBE, (data, ack) => {
@@ -60,38 +100,18 @@ export function registerSocketHandlers(io, socket) {
   socket.on('presence:online', () => {
     const user = socket.data.user
     if (!user) return
-
-    onlineUsers.set(user.id, {
-      name: user.name,
-      role: user.role,
-      socketId: socket.id,
-      since: new Date().toISOString(),
-    })
-
-    broadcastPresence(io, user.id, true)
-
-    // Jika admin online → broadcast ke semua user yang punya room
-    if (user.role === 'admin') {
-      socket.broadcast.emit(Events.USER_ONLINE, { userId: user.id, role: 'admin', online: true })
-    }
+    handleUserOnline(io, socket, user)
   })
 
   /* ── Presence: user/admin goes offline ── */
   socket.on('presence:offline', () => {
     const user = socket.data.user
     if (!user) return
-
-    onlineUsers.delete(user.id)
-    broadcastPresence(io, user.id, false)
-
-    if (user.role === 'admin') {
-      socket.broadcast.emit(Events.USER_OFFLINE, { userId: user.id, role: 'admin', online: false })
-    }
+    handleUserOffline(io, socket, user)
   })
 
   /* ── Get admin presence (untuk initial load di ChatWidget) ── */
   socket.on('presence:get_admin', (data, ack) => {
-    // Cari user dengan role admin yang sedang online
     let adminOnline = false
     for (const [, info] of onlineUsers) {
       if (info.role === 'admin') {
@@ -112,7 +132,7 @@ export function registerSocketHandlers(io, socket) {
     }
     const users = []
     for (const [userId, info] of onlineUsers) {
-      users.push({ userId, ...info })
+      users.push({ userId, name: info.name, role: info.role, since: info.since, online: true })
     }
     if (typeof ack === 'function') ack({ users })
   })
@@ -211,15 +231,52 @@ export function registerSocketHandlers(io, socket) {
     }
   })
 
+  // Admin delete chat session
+  socket.on('chat:delete_session', (data, ack) => {
+    if (socket.data.user?.role !== 'admin') {
+      return socket.emit(Events.SERVER_ERROR, { message: 'Forbidden: Admin only.' })
+    }
+    const targetUserId = Number(data?.userId)
+    if (!targetUserId) {
+      return socket.emit(Events.SERVER_ERROR, { message: 'Bad Request: target userId required.' })
+    }
+    
+    deleteChatSession(targetUserId)
+
+    // Broadcast to that user's room to clear their chat history live
+    io.to(`user:${targetUserId}`).emit('chat:session_deleted', { userId: targetUserId })
+    // Broadcast to admin channel to sync other admin sessions
+    io.to(Channels.ADMIN).emit('chat:session_deleted', { userId: targetUserId })
+    // Broadcast updated threads list to admin
+    io.to(Channels.ADMIN).emit(Events.CHAT_THREAD_UPDATED, getChatThreads())
+
+    if (typeof ack === 'function') {
+      ack({ ok: true })
+    }
+  })
+
+  // Admin delete all chats history
+  socket.on('chat:delete_all', (data, ack) => {
+    if (socket.data.user?.role !== 'admin') {
+      return socket.emit(Events.SERVER_ERROR, { message: 'Forbidden: Admin only.' })
+    }
+    
+    deleteAllChats()
+
+    // Broadcast to all clients to clear all chats live
+    io.emit('chat:all_deleted')
+    // Broadcast updated threads list to admin (which is now empty)
+    io.to(Channels.ADMIN).emit(Events.CHAT_THREAD_UPDATED, [])
+
+    if (typeof ack === 'function') {
+      ack({ ok: true })
+    }
+  })
+
   socket.on('disconnect', (reason) => {
-    // Auto-cleanup presence saat disconnect mendadak (jaringan putus, dll.)
     const user = socket.data.user
-    if (user && onlineUsers.has(user.id)) {
-      onlineUsers.delete(user.id)
-      broadcastPresence(io, user.id, false)
-      if (user.role === 'admin') {
-        socket.broadcast.emit(Events.USER_OFFLINE, { userId: user.id, role: 'admin', online: false })
-      }
+    if (user) {
+      handleUserOffline(io, socket, user)
     }
 
     if (process.env.NODE_ENV !== 'production') {

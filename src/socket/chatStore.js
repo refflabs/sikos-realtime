@@ -50,3 +50,18 @@ export function getChatThreads() {
     }
   }).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
 }
+
+export function deleteChatSession(userId) {
+  if (messages[userId]) {
+    delete messages[userId]
+    saveMessages()
+    return true
+  }
+  return false
+}
+
+export function deleteAllChats() {
+  messages = {}
+  saveMessages()
+  return true
+}
